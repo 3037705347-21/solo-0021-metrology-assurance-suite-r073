@@ -164,6 +164,12 @@ func (s *Service) RecordMeasurement(ctx context.Context, caseID string, input co
 		if err := m.AppendMeasurement(measurement); err != nil {
 			return err
 		}
+		if open, exists := m.OpenRequest(item.ID); exists {
+			open.FulfilledBy = measurement.ID
+			if err := m.UpdateRequest(open); err != nil {
+				return err
+			}
+		}
 		if err := m.UpdateCase(item); err != nil {
 			return err
 		}
@@ -220,6 +226,58 @@ func (s *Service) ReopenCase(ctx context.Context, caseID string, input contracts
 			"case_reopened",
 			actor,
 			reason,
+			s.now(),
+		)
+		if err != nil {
+			return err
+		}
+		m.AppendEvent(event)
+		result = caseResponse(m, item)
+		return nil
+	})
+	return result, err
+}
+
+func (s *Service) RequestSupplementaryMeasurement(ctx context.Context, caseID string, input contracts.SupplementaryMeasurementRequest) (contracts.CaseResponse, error) {
+	var result contracts.CaseResponse
+	err := s.repository.Mutate(ctx, func(m *repository.Mutation) error {
+		id := strings.TrimSpace(caseID)
+		item, exists := m.Case(id)
+		if !exists {
+			return fmt.Errorf("%w: case %s", domain.ErrNotFound, id)
+		}
+		measurement, ok := bestAcceptedMeasurement(m.Measurements(item.ID))
+		if !ok {
+			return fmt.Errorf("%w: an accepted measurement is required before review", domain.ErrStateConflict)
+		}
+		if err := item.RequestSupplementaryMeasurement(s.now()); err != nil {
+			return err
+		}
+		request, err := domain.NewSupplementaryRequest(
+			m.NextID("request"),
+			item.ID,
+			measurement.ID,
+			input.Reviewer,
+			input.Reason,
+			s.now(),
+		)
+		if err != nil {
+			return err
+		}
+		if err := m.AppendRequest(request); err != nil {
+			return err
+		}
+		if err := m.UpdateCase(item); err != nil {
+			return err
+		}
+		event, err := domain.NewAuditEvent(
+			m.NextID("event"),
+			"case",
+			item.ID,
+			item.ID,
+			"supplementary_measurement_requested",
+			request.Reviewer,
+			request.Reason,
 			s.now(),
 		)
 		if err != nil {
@@ -307,6 +365,7 @@ func caseResponse(m *repository.Mutation, item domain.VerificationCase) contract
 	result := contracts.CaseResponse{
 		Case:         item,
 		Measurements: m.Measurements(item.ID),
+		Requests:     m.Requests(item.ID),
 		Events:       m.Events(item.ID),
 	}
 	if seal, exists := m.Seal(item.ID); exists {
@@ -319,6 +378,7 @@ func caseResponseFromSnapshot(snapshot repository.Snapshot, item domain.Verifica
 	result := contracts.CaseResponse{
 		Case:         item,
 		Measurements: snapshot.Measurements(item.ID),
+		Requests:     snapshot.Requests(item.ID),
 		Events:       snapshot.Events(item.ID),
 	}
 	if seal, exists := snapshot.Seal(item.ID); exists {

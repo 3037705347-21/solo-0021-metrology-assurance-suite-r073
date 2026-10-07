@@ -84,6 +84,20 @@ func (s *Server) reopenCase(writer http.ResponseWriter, request *http.Request) {
 	writeJSON(writer, http.StatusOK, view)
 }
 
+func (s *Server) requestSupplementaryMeasurement(writer http.ResponseWriter, request *http.Request) {
+	input, err := decodeJSON[contracts.SupplementaryMeasurementRequest](writer, request)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	view, err := s.service.RequestSupplementaryMeasurement(request.Context(), request.PathValue("id"), input)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	writeJSON(writer, http.StatusCreated, view)
+}
+
 func (s *Server) sealCase(writer http.ResponseWriter, request *http.Request) {
 	input, err := decodeJSON[contracts.SealCaseRequest](writer, request)
 	if err != nil {

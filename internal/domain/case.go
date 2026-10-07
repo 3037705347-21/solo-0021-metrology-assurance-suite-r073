@@ -93,6 +93,16 @@ func (c *VerificationCase) Reopen(at time.Time) error {
 	return nil
 }
 
+func (c *VerificationCase) RequestSupplementaryMeasurement(at time.Time) error {
+	if c.State != CaseReviewReady {
+		return fmt.Errorf("%w: case is not ready for review", ErrStateConflict)
+	}
+	c.State = CaseAwaitingMeasurement
+	c.Version++
+	c.UpdatedAt = at.UTC()
+	return nil
+}
+
 func (c *VerificationCase) Seal(at time.Time) error {
 	if c.State != CaseReviewReady {
 		return fmt.Errorf("%w: case is not ready for review", ErrStateConflict)

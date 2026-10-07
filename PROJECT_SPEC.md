@@ -5,8 +5,9 @@
 Metrology Assurance Suite is a local HTTP service that keeps a traceable record
 of laboratory measurement assurance work. It registers devices, opens a
 verification case for one device, records technician measurements, requests a
-repeat measurement when tolerance is exceeded, and seals the final evidence
-record after review.
+repeat measurement when tolerance is exceeded, lets the reviewer request a
+supplementary measurement before sealing, and seals the final evidence record
+after review.
 
 The service is intentionally self-contained. It uses an in-memory repository
 with atomic copy-on-write mutations and does not require a database or an
@@ -26,6 +27,9 @@ external service.
   value, tolerance, current state, version, and assigned steward.
 - Measurement: an observed value, computed deviation, acceptance decision,
   technician, and timestamp.
+- SupplementaryRequest: a reviewer's formal request for another measurement,
+  linked to the accepted measurement under review and to the measurement that
+  answered it.
 - EvidenceSeal: the immutable closing record for a reviewed case, including the
   selected accepted measurement.
 - AuditEvent: an append-only trace of meaningful case and device changes.
@@ -58,7 +62,18 @@ The steward sends `POST /cases/{id}/reopen` after an out-of-tolerance result.
 Only `recheck_required` cases may move back to `awaiting_measurement`. The
 service records the actor and reason in the audit trail.
 
-### 5. Seal Verification
+### 5. Request Supplementary Measurement
+
+The verifier sends `POST /cases/{id}/supplementary-requests` with a reviewer
+and reason when the accepted measurement is not enough evidence to seal. Only
+`review_ready` cases accept a request. The service links the request to the
+accepted measurement under review, moves the case back to
+`awaiting_measurement`, and keeps the request open until the next recorded
+measurement fulfills it. A fulfilled request keeps both links, so the review
+trail shows which measurement was questioned and which one answered the
+request.
+
+### 6. Seal Verification
 
 The verifier sends `POST /cases/{id}/seal` after an accepted measurement. Only
 `review_ready` cases may be sealed. The service selects the accepted
@@ -77,6 +92,7 @@ VerificationCase state:
 - `awaiting_measurement -> review_ready`
 - `awaiting_measurement -> recheck_required`
 - `recheck_required -> awaiting_measurement`
+- `review_ready -> awaiting_measurement`
 - `review_ready -> sealed`
 - `sealed` is terminal.
 
@@ -87,7 +103,10 @@ Required invariants:
 - Measurements are accepted only while a case is awaiting measurement.
 - A tolerance must be positive.
 - A case can have at most one evidence seal.
-- A sealed case cannot accept measurements, reopen, or seal again.
+- A case can have at most one open supplementary request; the next recorded
+  measurement fulfills it.
+- A sealed case cannot accept measurements, reopen, seal again, or accept a
+  supplementary request.
 - Every mutation that changes a case also appends an audit event in the same
   repository commit.
 
@@ -111,6 +130,7 @@ Required invariants:
 - `GET /cases/{id}`
 - `POST /cases/{id}/measurements`
 - `POST /cases/{id}/reopen`
+- `POST /cases/{id}/supplementary-requests`
 - `POST /cases/{id}/seal`
 - `GET /cases/{id}/events`
 
@@ -121,7 +141,8 @@ bounded production smoke command under `cmd/workflowcheck`. The command starts
 an HTTP test server in the same process, calls the public routes, and verifies
 both success and failure behavior. The seal check also races two concurrent
 seal requests to prove that the repository mutation lock permits exactly one
-seal.
+seal. The supplementary request check races a request against a seal to prove
+that exactly one review decision commits.
 
 Tests are intentionally deferred for this initialization baseline. The later
 engineering-task stage will add unit and integration tests, including red/green

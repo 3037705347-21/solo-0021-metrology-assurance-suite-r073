@@ -35,11 +35,12 @@ func main() {
 	flag.Parse()
 
 	checks := map[string]func() error{
-		"register-device":          checkRegisterDevice,
-		"open-verification-case":   checkOpenVerificationCase,
-		"record-measurement":       checkRecordMeasurement,
-		"reopen-verification-case": checkReopenVerificationCase,
-		"seal-verification":        checkSealVerification,
+		"register-device":                   checkRegisterDevice,
+		"open-verification-case":            checkOpenVerificationCase,
+		"record-measurement":                checkRecordMeasurement,
+		"reopen-verification-case":          checkReopenVerificationCase,
+		"request-supplementary-measurement": checkRequestSupplementaryMeasurement,
+		"seal-verification":                 checkSealVerification,
 	}
 	run, ok := checks[*workflow]
 	if !ok {
@@ -304,6 +305,204 @@ func checkReopenVerificationCase() error {
 	return nil
 }
 
+func checkRequestSupplementaryMeasurement() error {
+	h := newHarness()
+	defer h.close()
+
+	caseID, err := h.readyCase("MET-1501")
+	if err != nil {
+		return err
+	}
+	read, err := h.request(http.MethodGet, "/cases/"+caseID, nil)
+	if err != nil {
+		return err
+	}
+	measurementID, err := nestedStringAt(read.Body, "measurements", 0, "id")
+	if err != nil {
+		return err
+	}
+
+	requested, err := h.request(http.MethodPost, "/cases/"+caseID+"/supplementary-requests", map[string]any{
+		"reviewer": "Wei",
+		"reason":   "single reading is not enough evidence for sealing",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(requested, http.StatusCreated); err != nil {
+		return err
+	}
+	state, err := nestedString(requested.Body, "case", "state")
+	if err != nil {
+		return err
+	}
+	if state != "awaiting_measurement" {
+		return fmt.Errorf("requested case state = %q", state)
+	}
+	linked, err := nestedStringAt(requested.Body, "supplementary_requests", 0, "measurement_id")
+	if err != nil {
+		return err
+	}
+	if linked != measurementID {
+		return fmt.Errorf("request linked to measurement %q, expected %q", linked, measurementID)
+	}
+
+	duplicate, err := h.request(http.MethodPost, "/cases/"+caseID+"/supplementary-requests", map[string]any{
+		"reviewer": "Wei",
+		"reason":   "duplicate request",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(duplicate, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(duplicate, "state_conflict"); err != nil {
+		return err
+	}
+
+	followUp, err := h.recordMeasurement(caseID, 25.3, "Rui")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(followUp, http.StatusCreated); err != nil {
+		return err
+	}
+	followUpID, err := nestedStringAt(followUp.Body, "measurements", 1, "id")
+	if err != nil {
+		return err
+	}
+	fulfilledBy, err := nestedStringAt(followUp.Body, "supplementary_requests", 0, "fulfilled_by")
+	if err != nil {
+		return err
+	}
+	if fulfilledBy != followUpID {
+		return fmt.Errorf("request fulfilled by %q, expected %q", fulfilledBy, followUpID)
+	}
+
+	sealed, err := h.request(http.MethodPost, "/cases/"+caseID+"/seal", map[string]any{
+		"reviewer": "Wei",
+		"summary":  "supplementary measurement completed the evidence",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(sealed, http.StatusCreated); err != nil {
+		return err
+	}
+
+	afterSeal, err := h.request(http.MethodPost, "/cases/"+caseID+"/supplementary-requests", map[string]any{
+		"reviewer": "Wei",
+		"reason":   "sealed cases cannot be reopened",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(afterSeal, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(afterSeal, "state_conflict"); err != nil {
+		return err
+	}
+
+	events, err := h.request(http.MethodGet, "/cases/"+caseID+"/events", nil)
+	if err != nil {
+		return err
+	}
+	if !hasEvent(events.Body, "supplementary_measurement_requested") {
+		return errors.New("supplementary request audit event is missing")
+	}
+
+	raceCaseID, err := h.readyCase("MET-1502")
+	if err != nil {
+		return err
+	}
+	type outcome struct {
+		response apiResponse
+		err      error
+	}
+	results := make(chan outcome, 2)
+	var wait sync.WaitGroup
+	wait.Add(2)
+	go func() {
+		defer wait.Done()
+		response, err := h.request(http.MethodPost, "/cases/"+raceCaseID+"/supplementary-requests", map[string]any{
+			"reviewer": "Wei",
+			"reason":   "need a second reading before sealing",
+		})
+		results <- outcome{response: response, err: err}
+	}()
+	go func() {
+		defer wait.Done()
+		response, err := h.request(http.MethodPost, "/cases/"+raceCaseID+"/seal", map[string]any{
+			"reviewer": "Wei",
+			"summary":  "racing seal against supplementary request",
+		})
+		results <- outcome{response: response, err: err}
+	}()
+	wait.Wait()
+	close(results)
+
+	successes := 0
+	conflicts := 0
+	for item := range results {
+		if item.err != nil {
+			return item.err
+		}
+		switch item.response.Status {
+		case http.StatusCreated:
+			successes++
+		case http.StatusConflict:
+			conflicts++
+		default:
+			return fmt.Errorf("unexpected race status %d: %s", item.response.Status, item.response.Raw)
+		}
+	}
+	if successes != 1 || conflicts != 1 {
+		return fmt.Errorf("request vs seal race outcomes: %d success, %d conflict", successes, conflicts)
+	}
+
+	reworkCaseID, err := h.readyCase("MET-1503")
+	if err != nil {
+		return err
+	}
+	rework, err := h.request(http.MethodPost, "/cases/"+reworkCaseID+"/supplementary-requests", map[string]any{
+		"reviewer": "Wei",
+		"reason":   "first reading looked unstable",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(rework, http.StatusCreated); err != nil {
+		return err
+	}
+	rejected, err := h.recordMeasurement(reworkCaseID, 26.5, "Rui")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(rejected, http.StatusCreated); err != nil {
+		return err
+	}
+	rejectedState, err := nestedString(rejected.Body, "case", "state")
+	if err != nil {
+		return err
+	}
+	if rejectedState != "recheck_required" {
+		return fmt.Errorf("failed supplementary measurement state = %q", rejectedState)
+	}
+	reopened, err := h.request(http.MethodPost, "/cases/"+reworkCaseID+"/reopen", map[string]any{
+		"actor":  "Lin",
+		"reason": "supplementary measurement failed, rework the setup",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(reopened, http.StatusOK); err != nil {
+		return err
+	}
+	return nil
+}
+
 func checkSealVerification() error {
 	h := newHarness()
 	defer h.close()
@@ -535,6 +734,18 @@ func nestedString(root map[string]any, path ...string) (string, error) {
 	text, ok := value.(string)
 	if !ok {
 		return "", fmt.Errorf("%s is not a string", strings.Join(path, "."))
+	}
+	return text, nil
+}
+
+func nestedStringAt(root map[string]any, path ...any) (string, error) {
+	value, err := nestedAny(root, path...)
+	if err != nil {
+		return "", err
+	}
+	text, ok := value.(string)
+	if !ok {
+		return "", fmt.Errorf("%v is not a string", path)
 	}
 	return text, nil
 }
