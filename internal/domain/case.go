@@ -105,6 +105,25 @@ func (c *VerificationCase) Seal(at time.Time) error {
 	return nil
 }
 
+// RequestSupplementaryMeasurement moves a review_ready case back to
+// awaiting_measurement after a verifier formally requests another measurement.
+// Existing measurements are retained and stay linked to the request via the
+// request's based-on/result references. A sealed case can never take this
+// transition.
+func (c *VerificationCase) RequestSupplementaryMeasurement(at time.Time) error {
+	switch c.State {
+	case CaseReviewReady:
+	case CaseSealed:
+		return fmt.Errorf("%w: a sealed case cannot request supplementary measurement", ErrStateConflict)
+	default:
+		return fmt.Errorf("%w: only a review_ready case can request supplementary measurement", ErrStateConflict)
+	}
+	c.State = CaseAwaitingMeasurement
+	c.Version++
+	c.UpdatedAt = at.UTC()
+	return nil
+}
+
 func isFinite(value float64) bool {
 	return !math.IsNaN(value) && !math.IsInf(value, 0)
 }

@@ -9,31 +9,34 @@ import (
 )
 
 type Repository struct {
-	mu           sync.RWMutex
-	devices      map[string]domain.Device
-	cases        map[string]domain.VerificationCase
-	measurements map[string][]domain.Measurement
-	seals        map[string]domain.EvidenceSeal
-	events       []domain.AuditEvent
-	counters     map[string]int
+	mu                    sync.RWMutex
+	devices               map[string]domain.Device
+	cases                 map[string]domain.VerificationCase
+	measurements          map[string][]domain.Measurement
+	seals                 map[string]domain.EvidenceSeal
+	supplementaryRequests map[string][]domain.SupplementaryMeasurementRequest
+	events                []domain.AuditEvent
+	counters              map[string]int
 }
 
 func New() *Repository {
 	return &Repository{
-		devices:      make(map[string]domain.Device),
-		cases:        make(map[string]domain.VerificationCase),
-		measurements: make(map[string][]domain.Measurement),
-		seals:        make(map[string]domain.EvidenceSeal),
-		counters:     make(map[string]int),
+		devices:               make(map[string]domain.Device),
+		cases:                 make(map[string]domain.VerificationCase),
+		measurements:          make(map[string][]domain.Measurement),
+		seals:                 make(map[string]domain.EvidenceSeal),
+		supplementaryRequests: make(map[string][]domain.SupplementaryMeasurementRequest),
+		counters:              make(map[string]int),
 	}
 }
 
 type Snapshot struct {
-	devices      map[string]domain.Device
-	cases        map[string]domain.VerificationCase
-	measurements map[string][]domain.Measurement
-	seals        map[string]domain.EvidenceSeal
-	events       []domain.AuditEvent
+	devices               map[string]domain.Device
+	cases                 map[string]domain.VerificationCase
+	measurements          map[string][]domain.Measurement
+	seals                 map[string]domain.EvidenceSeal
+	supplementaryRequests map[string][]domain.SupplementaryMeasurementRequest
+	events                []domain.AuditEvent
 }
 
 func (s Snapshot) Device(id string) (domain.Device, bool) {
@@ -64,6 +67,21 @@ func (s Snapshot) Seal(caseID string) (domain.EvidenceSeal, bool) {
 	return item, ok
 }
 
+func (s Snapshot) SupplementaryRequests(caseID string) []domain.SupplementaryMeasurementRequest {
+	return append([]domain.SupplementaryMeasurementRequest(nil), s.supplementaryRequests[caseID]...)
+}
+
+// OpenSupplementaryRequest returns the case's current unresolved supplementary
+// measurement request, if any. At most one may be open at a time.
+func (s Snapshot) OpenSupplementaryRequest(caseID string) (domain.SupplementaryMeasurementRequest, bool) {
+	for _, item := range s.supplementaryRequests[caseID] {
+		if item.IsOpen() {
+			return item, true
+		}
+	}
+	return domain.SupplementaryMeasurementRequest{}, false
+}
+
 func (s Snapshot) Events(caseID string) []domain.AuditEvent {
 	var result []domain.AuditEvent
 	for _, item := range s.events {
@@ -91,12 +109,13 @@ func (s Snapshot) AllCases() []domain.VerificationCase {
 }
 
 type Mutation struct {
-	devices      map[string]domain.Device
-	cases        map[string]domain.VerificationCase
-	measurements map[string][]domain.Measurement
-	seals        map[string]domain.EvidenceSeal
-	events       []domain.AuditEvent
-	counters     map[string]int
+	devices               map[string]domain.Device
+	cases                 map[string]domain.VerificationCase
+	measurements          map[string][]domain.Measurement
+	seals                 map[string]domain.EvidenceSeal
+	supplementaryRequests map[string][]domain.SupplementaryMeasurementRequest
+	events                []domain.AuditEvent
+	counters              map[string]int
 }
 
 func (m *Mutation) NextID(prefix string) string {
@@ -189,6 +208,46 @@ func (m *Mutation) PutSeal(item domain.EvidenceSeal) error {
 	return nil
 }
 
+// AppendSupplementaryRequest stores a new request and enforces the single-open
+// trajectory invariant: a case can never carry two unresolved requests.
+func (m *Mutation) AppendSupplementaryRequest(item domain.SupplementaryMeasurementRequest) error {
+	if _, exists := m.cases[item.CaseID]; !exists {
+		return fmt.Errorf("%w: case %s", domain.ErrNotFound, item.CaseID)
+	}
+	if _, open := m.OpenSupplementaryRequest(item.CaseID); open {
+		return fmt.Errorf("%w: case %s already has an open supplementary measurement request", domain.ErrStateConflict, item.CaseID)
+	}
+	m.supplementaryRequests[item.CaseID] = append(m.supplementaryRequests[item.CaseID], item)
+	return nil
+}
+
+func (m *Mutation) SupplementaryRequests(caseID string) []domain.SupplementaryMeasurementRequest {
+	return append([]domain.SupplementaryMeasurementRequest(nil), m.supplementaryRequests[caseID]...)
+}
+
+func (m *Mutation) OpenSupplementaryRequest(caseID string) (domain.SupplementaryMeasurementRequest, bool) {
+	for _, item := range m.supplementaryRequests[caseID] {
+		if item.IsOpen() {
+			return item, true
+		}
+	}
+	return domain.SupplementaryMeasurementRequest{}, false
+}
+
+// ResolveSupplementaryRequest records the answered request in place so its
+// based-on and result measurements stay linked in one consistent record.
+func (m *Mutation) ResolveSupplementaryRequest(item domain.SupplementaryMeasurementRequest) error {
+	items := m.supplementaryRequests[item.CaseID]
+	for index := range items {
+		if items[index].ID == item.ID {
+			items[index] = item
+			m.supplementaryRequests[item.CaseID] = items
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: supplementary measurement request %s", domain.ErrNotFound, item.ID)
+}
+
 func (m *Mutation) AppendEvent(item domain.AuditEvent) {
 	m.events = append(m.events, item)
 }
@@ -220,12 +279,13 @@ func (r *Repository) Mutate(ctx context.Context, fn func(*Mutation) error) error
 	defer r.mu.Unlock()
 
 	next := &Mutation{
-		devices:      cloneDevices(r.devices),
-		cases:        cloneCases(r.cases),
-		measurements: cloneMeasurements(r.measurements),
-		seals:        cloneSeals(r.seals),
-		events:       append([]domain.AuditEvent(nil), r.events...),
-		counters:     cloneCounters(r.counters),
+		devices:               cloneDevices(r.devices),
+		cases:                 cloneCases(r.cases),
+		measurements:          cloneMeasurements(r.measurements),
+		seals:                 cloneSeals(r.seals),
+		supplementaryRequests: cloneSupplementaryRequests(r.supplementaryRequests),
+		events:                append([]domain.AuditEvent(nil), r.events...),
+		counters:              cloneCounters(r.counters),
 	}
 	if err := fn(next); err != nil {
 		return err
@@ -234,6 +294,7 @@ func (r *Repository) Mutate(ctx context.Context, fn func(*Mutation) error) error
 	r.cases = next.cases
 	r.measurements = next.measurements
 	r.seals = next.seals
+	r.supplementaryRequests = next.supplementaryRequests
 	r.events = next.events
 	r.counters = next.counters
 	return nil
@@ -241,11 +302,12 @@ func (r *Repository) Mutate(ctx context.Context, fn func(*Mutation) error) error
 
 func (r *Repository) snapshot() Snapshot {
 	return Snapshot{
-		devices:      cloneDevices(r.devices),
-		cases:        cloneCases(r.cases),
-		measurements: cloneMeasurements(r.measurements),
-		seals:        cloneSeals(r.seals),
-		events:       append([]domain.AuditEvent(nil), r.events...),
+		devices:               cloneDevices(r.devices),
+		cases:                 cloneCases(r.cases),
+		measurements:          cloneMeasurements(r.measurements),
+		seals:                 cloneSeals(r.seals),
+		supplementaryRequests: cloneSupplementaryRequests(r.supplementaryRequests),
+		events:                append([]domain.AuditEvent(nil), r.events...),
 	}
 }
 
@@ -277,6 +339,14 @@ func cloneSeals(values map[string]domain.EvidenceSeal) map[string]domain.Evidenc
 	result := make(map[string]domain.EvidenceSeal, len(values))
 	for key, value := range values {
 		result[key] = value
+	}
+	return result
+}
+
+func cloneSupplementaryRequests(values map[string][]domain.SupplementaryMeasurementRequest) map[string][]domain.SupplementaryMeasurementRequest {
+	result := make(map[string][]domain.SupplementaryMeasurementRequest, len(values))
+	for key, value := range values {
+		result[key] = append([]domain.SupplementaryMeasurementRequest(nil), value...)
 	}
 	return result
 }

@@ -35,11 +35,12 @@ func main() {
 	flag.Parse()
 
 	checks := map[string]func() error{
-		"register-device":          checkRegisterDevice,
-		"open-verification-case":   checkOpenVerificationCase,
-		"record-measurement":       checkRecordMeasurement,
-		"reopen-verification-case": checkReopenVerificationCase,
-		"seal-verification":        checkSealVerification,
+		"register-device":                   checkRegisterDevice,
+		"open-verification-case":            checkOpenVerificationCase,
+		"record-measurement":                checkRecordMeasurement,
+		"reopen-verification-case":          checkReopenVerificationCase,
+		"seal-verification":                 checkSealVerification,
+		"supplementary-measurement-request": checkSupplementaryMeasurementRequest,
 	}
 	run, ok := checks[*workflow]
 	if !ok {
@@ -375,6 +376,351 @@ func checkSealVerification() error {
 	return nil
 }
 
+func checkSupplementaryMeasurementRequest() error {
+	h := newHarness()
+	defer h.close()
+
+	// Happy path: reviewer requests another measurement, technician answers
+	// with an in-tolerance value, request resolves accepted and the case
+	// becomes review_ready again with every measurement preserved.
+	caseID, err := h.readyCase("MET-1501")
+	if err != nil {
+		return err
+	}
+	before, err := h.request(http.MethodGet, "/cases/"+caseID, nil)
+	if err != nil {
+		return err
+	}
+	basisID, err := nestedStringAt(before.Body, "measurements", 0, "id")
+	if err != nil {
+		return err
+	}
+	requested, err := h.requestSupplementary(caseID, "Reviewer-A", "reading looks unstable; repeat at midpoint")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(requested, http.StatusCreated); err != nil {
+		return err
+	}
+	state, err := nestedString(requested.Body, "case", "state")
+	if err != nil {
+		return err
+	}
+	if state != "awaiting_measurement" {
+		return fmt.Errorf("case state after supplementary request = %q", state)
+	}
+	requestsView, err := nestedSlice(requested.Body, "supplementary_measurement_requests")
+	if err != nil {
+		return err
+	}
+	if len(requestsView) != 1 {
+		return fmt.Errorf("supplementary request count = %d, expected 1", len(requestsView))
+	}
+	requestID, err := nestedStringAt(requested.Body, "supplementary_measurement_requests", 0, "id")
+	if err != nil {
+		return err
+	}
+	if requestID == "" {
+		return errors.New("supplementary request id is missing")
+	}
+	requestStatus, err := nestedStringAt(requested.Body, "supplementary_measurement_requests", 0, "status")
+	if err != nil {
+		return err
+	}
+	if requestStatus != "requested" {
+		return fmt.Errorf("new request status = %q", requestStatus)
+	}
+	basedOn, err := nestedStringAt(requested.Body, "supplementary_measurement_requests", 0, "based_on_measurement_id")
+	if err != nil {
+		return err
+	}
+	if basedOn != basisID {
+		return fmt.Errorf("request based on %q, expected %q", basedOn, basisID)
+	}
+	measurementsView, err := nestedSlice(requested.Body, "measurements")
+	if err != nil {
+		return err
+	}
+	if len(measurementsView) != 1 {
+		return fmt.Errorf("requesting supplementary measurement changed measurement history: %d entries", len(measurementsView))
+	}
+
+	// A duplicate request while the case is back in measurement is rejected.
+	duplicate, err := h.requestSupplementary(caseID, "Reviewer-A", "duplicate request")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(duplicate, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(duplicate, "state_conflict"); err != nil {
+		return err
+	}
+
+	// Technician answers; in-tolerance result closes the request accepted and
+	// returns the case to review_ready.
+	answered, err := h.recordMeasurement(caseID, 25.0, "Rui")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(answered, http.StatusCreated); err != nil {
+		return err
+	}
+	answeredState, err := nestedString(answered.Body, "case", "state")
+	if err != nil {
+		return err
+	}
+	if answeredState != "review_ready" {
+		return fmt.Errorf("state after accepted supplementary measurement = %q", answeredState)
+	}
+	resolvedStatus, err := nestedStringAt(answered.Body, "supplementary_measurement_requests", 0, "status")
+	if err != nil {
+		return err
+	}
+	if resolvedStatus != "accepted" {
+		return fmt.Errorf("request status after accepted measurement = %q", resolvedStatus)
+	}
+	resultID, err := nestedStringAt(answered.Body, "measurements", 1, "id")
+	if err != nil {
+		return err
+	}
+	linkedResult, err := nestedStringAt(answered.Body, "supplementary_measurement_requests", 0, "result_measurement_id")
+	if err != nil {
+		return err
+	}
+	if linkedResult != resultID {
+		return fmt.Errorf("request linked to result %q, expected %q", linkedResult, resultID)
+	}
+	history, err := nestedSlice(answered.Body, "measurements")
+	if err != nil {
+		return err
+	}
+	if len(history) != 2 {
+		return fmt.Errorf("measurement history after supplementary measurement = %d entries", len(history))
+	}
+
+	// After acceptance a new request is allowed (request already resolved);
+	// racing that request against a seal yields exactly one trajectory.
+	type outcome struct {
+		response apiResponse
+		err      error
+	}
+	results := make(chan outcome, 2)
+	var wait sync.WaitGroup
+	wait.Add(2)
+	go func() {
+		defer wait.Done()
+		response, err := h.requestSupplementary(caseID, "Reviewer-B", "request racing the seal")
+		results <- outcome{response: response, err: err}
+	}()
+	go func() {
+		defer wait.Done()
+		response, err := h.request(http.MethodPost, "/cases/"+caseID+"/seal", map[string]any{
+			"reviewer": "Reviewer-C",
+			"summary":  "sealed after accepted supplementary measurement",
+		})
+		results <- outcome{response: response, err: err}
+	}()
+	wait.Wait()
+	close(results)
+	successes := 0
+	conflicts := 0
+	var finalState string
+	for item := range results {
+		if item.err != nil {
+			return item.err
+		}
+		switch item.response.Status {
+		case http.StatusCreated:
+			successes++
+			finalState, _ = nestedString(item.response.Body, "case", "state")
+		case http.StatusConflict:
+			conflicts++
+		default:
+			return fmt.Errorf("unexpected concurrent status %d: %s", item.response.Status, item.response.Raw)
+		}
+	}
+	if successes != 1 || conflicts != 1 {
+		return fmt.Errorf("request/seal race outcomes: %d success, %d conflict", successes, conflicts)
+	}
+	read, err := h.request(http.MethodGet, "/cases/"+caseID, nil)
+	if err != nil {
+		return err
+	}
+	finalReadState, err := nestedString(read.Body, "case", "state")
+	if err != nil {
+		return err
+	}
+	if finalReadState != finalState {
+		return fmt.Errorf("final state inconsistent: response %q, stored %q", finalState, finalReadState)
+	}
+	if finalReadState != "sealed" && finalReadState != "awaiting_measurement" {
+		return fmt.Errorf("unexpected final state after race: %q", finalReadState)
+	}
+	openRequests := 0
+	allRequests, err := nestedSlice(read.Body, "supplementary_measurement_requests")
+	if err != nil {
+		return err
+	}
+	for _, item := range allRequests {
+		entry, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if entry["status"] == "requested" {
+			openRequests++
+		}
+	}
+	_, hasSeal := read.Body["seal"]
+	switch finalReadState {
+	case "sealed":
+		if openRequests != 0 {
+			return fmt.Errorf("sealed case carries %d open supplementary requests", openRequests)
+		}
+		if !hasSeal {
+			return errors.New("sealed case has no evidence seal")
+		}
+	case "awaiting_measurement":
+		// The request beat the seal: one open request must exist and no seal.
+		if openRequests != 1 {
+			return fmt.Errorf("request-won race leaves %d open requests, expected 1", openRequests)
+		}
+		if hasSeal {
+			return errors.New("awaiting case unexpectedly carries an evidence seal")
+		}
+	default:
+		return fmt.Errorf("unexpected final state after race: %q", finalReadState)
+	}
+	// Whatever happened, a second request is refused: sealed cases are
+	// terminal, and an open request already exists otherwise.
+	afterRace, err := h.requestSupplementary(caseID, "Reviewer-B", "second request after race")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(afterRace, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(afterRace, "state_conflict"); err != nil {
+		return err
+	}
+	events, err := h.request(http.MethodGet, "/cases/"+caseID+"/events", nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(events, http.StatusOK); err != nil {
+		return err
+	}
+	if !hasEvent(events.Body, "supplementary_measurement_requested") || !hasEvent(events.Body, "supplementary_measurement_accepted") {
+		return errors.New("supplementary measurement audit events are missing")
+	}
+
+	// Failed supplementary measurement: request is rejected and the case
+	// follows the unchanged recheck -> reopen trajectory with a single
+	// consistent chain, and a second request stays impossible until resolved.
+	rejectCase, err := h.readyCase("MET-1502")
+	if err != nil {
+		return err
+	}
+	firstRequest, err := h.requestSupplementary(rejectCase, "Reviewer-A", "repeat with new setup")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(firstRequest, http.StatusCreated); err != nil {
+		return err
+	}
+	failed, err := h.recordMeasurement(rejectCase, 26.5, "Rui")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(failed, http.StatusCreated); err != nil {
+		return err
+	}
+	failedState, err := nestedString(failed.Body, "case", "state")
+	if err != nil {
+		return err
+	}
+	if failedState != "recheck_required" {
+		return fmt.Errorf("state after failed supplementary measurement = %q", failedState)
+	}
+	failedStatus, err := nestedStringAt(failed.Body, "supplementary_measurement_requests", 0, "status")
+	if err != nil {
+		return err
+	}
+	if failedStatus != "rejected" {
+		return fmt.Errorf("request status after failed measurement = %q", failedStatus)
+	}
+	failedResult, err := nestedStringAt(failed.Body, "supplementary_measurement_requests", 0, "result_measurement_id")
+	if err != nil {
+		return err
+	}
+	if failedResult == "" {
+		return errors.New("rejected request has no result measurement link")
+	}
+	// Case is in recheck, not review_ready: requesting again must conflict
+	// rather than fork the trajectory.
+	reRequest, err := h.requestSupplementary(rejectCase, "Reviewer-A", "another request during recheck")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(reRequest, http.StatusConflict); err != nil {
+		return err
+	}
+	// The original steward reopen path is unchanged and still works.
+	reopened, err := h.request(http.MethodPost, "/cases/"+rejectCase+"/reopen", map[string]any{
+		"actor":  "Lin",
+		"reason": "replace fixture before next measurement",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(reopened, http.StatusOK); err != nil {
+		return err
+	}
+	reopenedState, err := nestedString(reopened.Body, "case", "state")
+	if err != nil {
+		return err
+	}
+	if reopenedState != "awaiting_measurement" {
+		return fmt.Errorf("state after reopen = %q", reopenedState)
+	}
+
+	// Requests are invalid outside review_ready (here: awaiting_measurement).
+	awaitingCaseID, err := func() (string, error) {
+		deviceID, err := h.createDevice("MET-1503")
+		if err != nil {
+			return "", err
+		}
+		opened, err := h.openCase(deviceID)
+		if err != nil {
+			return "", err
+		}
+		return nestedString(opened.Body, "case", "id")
+	}()
+	if err != nil {
+		return err
+	}
+	early, err := h.requestSupplementary(awaitingCaseID, "Reviewer-A", "no accepted measurement yet")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(early, http.StatusConflict); err != nil {
+		return err
+	}
+
+	// Missing reviewer/reason is a validation error.
+	missingInput, err := h.requestSupplementary(caseID, "", "missing reviewer")
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(missingInput, http.StatusBadRequest); err != nil {
+		return err
+	}
+	if err := expectErrorCode(missingInput, "invalid_input"); err != nil {
+		return err
+	}
+	return nil
+}
+
 func newHarness() *harness {
 	server := httptest.NewServer(bootstrap.NewHandler())
 	return &harness{
@@ -463,6 +809,13 @@ func (h *harness) recordMeasurement(caseID string, observed float64, technician 
 	})
 }
 
+func (h *harness) requestSupplementary(caseID, reviewer, reason string) (apiResponse, error) {
+	return h.request(http.MethodPost, "/cases/"+caseID+"/supplementary-measurement-requests", map[string]any{
+		"reviewer": reviewer,
+		"reason":   reason,
+	})
+}
+
 func (h *harness) rejectedCase(tag string) (string, error) {
 	deviceID, err := h.createDevice(tag)
 	if err != nil {
@@ -535,6 +888,18 @@ func nestedString(root map[string]any, path ...string) (string, error) {
 	text, ok := value.(string)
 	if !ok {
 		return "", fmt.Errorf("%s is not a string", strings.Join(path, "."))
+	}
+	return text, nil
+}
+
+func nestedStringAt(root map[string]any, path ...any) (string, error) {
+	value, err := nestedAny(root, path...)
+	if err != nil {
+		return "", err
+	}
+	text, ok := value.(string)
+	if !ok {
+		return "", fmt.Errorf("%v is not a string", path)
 	}
 	return text, nil
 }

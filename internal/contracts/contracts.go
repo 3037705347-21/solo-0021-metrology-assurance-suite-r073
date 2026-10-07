@@ -31,15 +31,21 @@ type SealCaseRequest struct {
 	Summary  string `json:"summary"`
 }
 
+type RequestSupplementaryMeasurementRequest struct {
+	Reviewer string `json:"reviewer"`
+	Reason   string `json:"reason"`
+}
+
 type DeviceResponse struct {
 	Device domain.Device `json:"device"`
 }
 
 type CaseResponse struct {
-	Case         domain.VerificationCase `json:"case"`
-	Measurements []domain.Measurement    `json:"measurements"`
-	Seal         *domain.EvidenceSeal    `json:"seal,omitempty"`
-	Events       []domain.AuditEvent     `json:"events"`
+	Case                  domain.VerificationCase                  `json:"case"`
+	Measurements          []domain.Measurement                     `json:"measurements"`
+	Seal                  *domain.EvidenceSeal                     `json:"seal,omitempty"`
+	SupplementaryRequests []domain.SupplementaryMeasurementRequest `json:"supplementary_measurement_requests"`
+	Events                []domain.AuditEvent                      `json:"events"`
 }
 
 type EventsResponse struct {

@@ -155,6 +155,29 @@
         "contracts",
         "bootstrap"
       ]
+    },
+    {
+      "id": "supplementary-measurement-request",
+      "name": "Request supplementary measurement during review",
+      "entry": "POST /cases/{id}/supplementary-measurement-requests",
+      "steps": [
+        "verify the case is review_ready with an accepted measurement and no open request",
+        "record a request based on the selected accepted measurement with reviewer and reason",
+        "return the case to awaiting_measurement while preserving measurement history",
+        "resolve the request with the next measurement as accepted or rejected in one commit"
+      ],
+      "success": "returns the case back in measurement with a request linked to its source and result measurements",
+      "failure": "returns conflict for sealed, duplicate, concurrent-seal, or non-review-ready requests",
+      "verification": "workflowcheck exercises both resolutions, duplicate and wrong-state requests, and a request/seal race",
+      "module_ids": [
+        "runtimecheck",
+        "httpapi",
+        "assurance",
+        "domain",
+        "repository",
+        "contracts",
+        "bootstrap"
+      ]
     }
   ],
   "complexity": {

@@ -187,10 +187,51 @@ func (s *Service) RecordMeasurement(ctx context.Context, caseID string, input co
 			return err
 		}
 		m.AppendEvent(event)
+		if err := s.resolveOpenSupplementaryRequest(m, item.ID, measurement); err != nil {
+			return err
+		}
 		result = caseResponse(m, item)
 		return nil
 	})
 	return result, err
+}
+
+// resolveOpenSupplementaryRequest closes the case's open request, if any, in
+// the same transaction as the measurement that answers it. The request status
+// follows the measurement decision so a failed supplementary measurement cannot
+// leave an open request contradicting the recheck trajectory.
+func (s *Service) resolveOpenSupplementaryRequest(m *repository.Mutation, caseID string, measurement domain.Measurement) error {
+	request, open := m.OpenSupplementaryRequest(caseID)
+	if !open {
+		return nil
+	}
+	if err := request.Resolve(measurement.ID, measurement.Accepted, s.now()); err != nil {
+		return err
+	}
+	if err := m.ResolveSupplementaryRequest(request); err != nil {
+		return err
+	}
+	kind := "supplementary_measurement_rejected"
+	detail := fmt.Sprintf("supplementary measurement %s for request %s still exceeds tolerance; request rejected", measurement.ID, request.ID)
+	if measurement.Accepted {
+		kind = "supplementary_measurement_accepted"
+		detail = fmt.Sprintf("supplementary measurement %s accepted for request %s", measurement.ID, request.ID)
+	}
+	event, err := domain.NewAuditEvent(
+		m.NextID("event"),
+		"case",
+		caseID,
+		caseID,
+		kind,
+		measurement.Technician,
+		detail,
+		s.now(),
+	)
+	if err != nil {
+		return err
+	}
+	m.AppendEvent(event)
+	return nil
 }
 
 func (s *Service) ReopenCase(ctx context.Context, caseID string, input contracts.ReopenCaseRequest) (contracts.CaseResponse, error) {
@@ -288,6 +329,74 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 	return result, err
 }
 
+// RequestSupplementaryMeasurement lets a verifier at review_ready send the case
+// back for another measurement instead of sealing it. The request references
+// the accepted measurement under review; the case, the request, and the audit
+// event commit atomically, so it cannot race a seal into two contradictory
+// trajectories.
+func (s *Service) RequestSupplementaryMeasurement(ctx context.Context, caseID string, input contracts.RequestSupplementaryMeasurementRequest) (contracts.CaseResponse, error) {
+	var result contracts.CaseResponse
+	reviewer := strings.TrimSpace(input.Reviewer)
+	reason := strings.TrimSpace(input.Reason)
+	if reviewer == "" || reason == "" {
+		return result, fmt.Errorf("%w: reviewer and reason are required", domain.ErrInvalidInput)
+	}
+	err := s.repository.Mutate(ctx, func(m *repository.Mutation) error {
+		id := strings.TrimSpace(caseID)
+		item, exists := m.Case(id)
+		if !exists {
+			return fmt.Errorf("%w: case %s", domain.ErrNotFound, id)
+		}
+		if _, sealed := m.Seal(item.ID); sealed {
+			return fmt.Errorf("%w: a sealed case cannot request supplementary measurement", domain.ErrStateConflict)
+		}
+		if _, open := m.OpenSupplementaryRequest(item.ID); open {
+			return fmt.Errorf("%w: case %s already has an open supplementary measurement request", domain.ErrStateConflict, item.ID)
+		}
+		basis, ok := bestAcceptedMeasurement(m.Measurements(item.ID))
+		if !ok {
+			return fmt.Errorf("%w: an accepted measurement is required before requesting supplementary measurement", domain.ErrStateConflict)
+		}
+		if err := item.RequestSupplementaryMeasurement(s.now()); err != nil {
+			return err
+		}
+		request, err := domain.NewSupplementaryMeasurementRequest(
+			m.NextID("supplementary_request"),
+			item.ID,
+			reviewer,
+			reason,
+			basis.ID,
+			s.now(),
+		)
+		if err != nil {
+			return err
+		}
+		if err := m.AppendSupplementaryRequest(request); err != nil {
+			return err
+		}
+		if err := m.UpdateCase(item); err != nil {
+			return err
+		}
+		event, err := domain.NewAuditEvent(
+			m.NextID("event"),
+			"case",
+			item.ID,
+			item.ID,
+			"supplementary_measurement_requested",
+			request.Reviewer,
+			fmt.Sprintf("supplementary measurement requested (%s) based on measurement %s: %s", request.ID, basis.ID, request.Reason),
+			s.now(),
+		)
+		if err != nil {
+			return err
+		}
+		m.AppendEvent(event)
+		result = caseResponse(m, item)
+		return nil
+	})
+	return result, err
+}
+
 func bestAcceptedMeasurement(items []domain.Measurement) (domain.Measurement, bool) {
 	var selected domain.Measurement
 	found := false
@@ -305,9 +414,10 @@ func bestAcceptedMeasurement(items []domain.Measurement) (domain.Measurement, bo
 
 func caseResponse(m *repository.Mutation, item domain.VerificationCase) contracts.CaseResponse {
 	result := contracts.CaseResponse{
-		Case:         item,
-		Measurements: m.Measurements(item.ID),
-		Events:       m.Events(item.ID),
+		Case:                  item,
+		Measurements:          m.Measurements(item.ID),
+		SupplementaryRequests: m.SupplementaryRequests(item.ID),
+		Events:                m.Events(item.ID),
 	}
 	if seal, exists := m.Seal(item.ID); exists {
 		result.Seal = &seal
@@ -317,9 +427,10 @@ func caseResponse(m *repository.Mutation, item domain.VerificationCase) contract
 
 func caseResponseFromSnapshot(snapshot repository.Snapshot, item domain.VerificationCase) contracts.CaseResponse {
 	result := contracts.CaseResponse{
-		Case:         item,
-		Measurements: snapshot.Measurements(item.ID),
-		Events:       snapshot.Events(item.ID),
+		Case:                  item,
+		Measurements:          snapshot.Measurements(item.ID),
+		SupplementaryRequests: snapshot.SupplementaryRequests(item.ID),
+		Events:                snapshot.Events(item.ID),
 	}
 	if seal, exists := snapshot.Seal(item.ID); exists {
 		result.Seal = &seal

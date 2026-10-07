@@ -21,6 +21,7 @@ go run ./cmd/workflowcheck --workflow register-device
 go run ./cmd/workflowcheck --workflow open-verification-case
 go run ./cmd/workflowcheck --workflow record-measurement
 go run ./cmd/workflowcheck --workflow reopen-verification-case
+go run ./cmd/workflowcheck --workflow supplementary-measurement-request
 go run ./cmd/workflowcheck --workflow seal-verification
 ```
 
@@ -40,6 +41,7 @@ or extend these smoke checks with red/green verification tests.
 - `GET /cases/{id}`
 - `POST /cases/{id}/measurements`
 - `POST /cases/{id}/reopen`
+- `POST /cases/{id}/supplementary-measurement-requests`
 - `POST /cases/{id}/seal`
 - `GET /cases/{id}/events`
 
